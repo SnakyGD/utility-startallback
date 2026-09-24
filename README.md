@@ -98,6 +98,20 @@ If you decide to modify or re-build my code, you are to not re-distribute. These
 
 <br />
 
+## GitHub Actions signing setup
+
+- Build workflow: run **Build SABActivator** (`.github/workflows/build.yml`) from Actions, or trigger it by push/PR to `main`, then download artifact `SABActivator-Release`.
+- Required secrets for signed CI build:
+  - `SIGNING_PFX_BASE64` (base64 of PFX)
+  - `SIGNING_PFX_PASSWORD` (password for that PFX)
+- One-time bootstrap for automated secret provisioning:
+  1. Create `SECRETS_ADMIN_TOKEN` manually in repository secrets (fine-grained PAT with minimum repository **Actions/Secrets write** access).
+  2. Run **Generate signing key** (`.github/workflows/generate-signing-key.yml`) with input `confirm=GENERATE`.
+- The workflows never commit certificates/keys. Private PFX material and password are not uploaded as artifacts; only the public `.cer` is uploaded (`signing-certificate-public`).
+- If signing secrets are absent, the build workflow uses an unsigned Release fallback so PR checks remain runnable.
+
+<br />
+
 ---
 
 <br />

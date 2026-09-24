@@ -1,0 +1,65 @@
+name: Build SABActivator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          $outputDir = (Join-Path $env:RUNNER_TEMP 'sab-release') + [IO.Path]::DirectorySeparatorChar
+          & msbuild SABActivator.csproj /p:Configuration=Release /p:Platform=AnyCPU "/p:OutDir=$outputDir" /p:SignManifests=false /p:SignAssembly=false
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Sign executable
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          $exePath = Join-Path $env:RUNNER_TEMP 'sab-release\SABActivator.exe'
+          if (-not (Test-Path $exePath)) {
+            throw "Executable not found: $exePath"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:SIGNING_PFX_PASSWORD)) {
+            throw 'Missing signing secrets. Run Generate signing key before building.'
+          }
+
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signTool = Get-ChildItem -Path $sdkBin -Filter signtool.exe -Recurse -File |
+            Where-Object { $_.DirectoryName -like '*\x64' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signTool) {
+            throw 'Windows SDK SignTool was not found.'
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'sab-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+          & $signTool.FullName sign /f $pfxPath /p $env:SIGNING_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exePath
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SABActivator-Release
+          path: ${{ runner.temp }}/sab-release/SABActivator.exe
+          if-no-files-found: error
