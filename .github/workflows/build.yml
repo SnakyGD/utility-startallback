@@ -1,0 +1,113 @@
+name: Build SABActivator
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Prepare optional signing key
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_PFX_BASE64) -and -not [string]::IsNullOrWhiteSpace($env:SIGNING_PFX_PASSWORD)) {
+            $pfxPath = Join-Path $env:RUNNER_TEMP 'sab-signing.pfx'
+            [System.IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+            "SIGNING_PFX_PATH=$pfxPath" >> $env:GITHUB_ENV
+            "SIGNING_MODE=signed" >> $env:GITHUB_ENV
+            Write-Host 'Signing secrets detected. Release build will be signed.'
+          }
+          else {
+            "SIGNING_MODE=unsigned" >> $env:GITHUB_ENV
+            Write-Host 'Signing secrets are not configured. Building unsigned Release artifact for CI verification.'
+          }
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          $arguments = @(
+            'SABActivator.sln'
+            '/m'
+            '/restore'
+            '/t:Build'
+            '/p:Configuration=Release'
+            '/p:Platform=Any CPU'
+            '/p:SignManifests=false'
+          )
+
+          if ($env:SIGNING_MODE -eq 'signed') {
+            $arguments += '/p:SignAssembly=true'
+            $arguments += '/p:AssemblyOriginatorKeyFile=' + $env:SIGNING_PFX_PATH
+            $arguments += '/p:ManifestKeyFile=' + $env:SIGNING_PFX_PATH
+            $arguments += '/p:ManifestCertificateThumbprint='
+          }
+          else {
+            $arguments += '/p:SignAssembly=false'
+            $arguments += '/p:AssemblyOriginatorKeyFile='
+            $arguments += '/p:ManifestKeyFile='
+            $arguments += '/p:ManifestCertificateThumbprint='
+          }
+
+          & msbuild @arguments
+
+      - name: Stage build artifact
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'bin\\Release'
+          if (-not (Test-Path $releaseDir)) {
+            throw "Release output directory not found: $releaseDir"
+          }
+
+          $stageDir = Join-Path $env:RUNNER_TEMP 'sab-artifact'
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          $patterns = @('*.exe', '*.pdb', '*.config', '*.manifest', '*.dll')
+          $copied = @()
+
+          foreach ($pattern in $patterns) {
+            $files = Get-ChildItem -Path $releaseDir -Filter $pattern -File -ErrorAction SilentlyContinue
+            foreach ($file in $files) {
+              Copy-Item -Path $file.FullName -Destination (Join-Path $stageDir $file.Name) -Force
+              $copied += $file.Name
+            }
+          }
+
+          if ($copied.Count -eq 0) {
+            throw 'No release artifacts were staged.'
+          }
+
+          "ARTIFACT_STAGE_DIR=$stageDir" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SABActivator-Release
+          path: ${{ env.ARTIFACT_STAGE_DIR }}
+          if-no-files-found: error
+
+      - name: Cleanup temporary signing key
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_PFX_PATH) -and (Test-Path $env:SIGNING_PFX_PATH)) {
+            Remove-Item -Path $env:SIGNING_PFX_PATH -Force
+          }

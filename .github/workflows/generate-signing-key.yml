@@ -1,0 +1,101 @@
+name: Generate signing key
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type GENERATE to create a new signing key and update repository secrets"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  generate-signing-key:
+    runs-on: windows-latest
+
+    steps:
+      - name: Validate confirmation input
+        shell: pwsh
+        run: |
+          if ($env:WORKFLOW_CONFIRM -ne 'GENERATE') {
+            throw "Confirmation failed. Re-run workflow with confirm=GENERATE."
+          }
+        env:
+          WORKFLOW_CONFIRM: ${{ github.event.inputs.confirm }}
+
+      - name: Check bootstrap token
+        shell: pwsh
+        env:
+          SECRETS_ADMIN_TOKEN: ${{ secrets.SECRETS_ADMIN_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SECRETS_ADMIN_TOKEN)) {
+            throw "Missing required secret SECRETS_ADMIN_TOKEN. Create a fine-grained PAT with repository Actions/Secrets write access, save it as SECRETS_ADMIN_TOKEN, and run this workflow again with confirm=GENERATE."
+          }
+
+      - name: Generate Authenticode-compatible certificate
+        shell: pwsh
+        run: |
+          $tempDir = Join-Path $env:RUNNER_TEMP 'sab-signing-key'
+          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+          $password = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+
+          $certificate = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject 'CN=SABActivator GitHub Actions Signing' `
+            -KeyAlgorithm RSA `
+            -KeyLength 4096 `
+            -HashAlgorithm SHA256 `
+            -CertStoreLocation 'Cert:\\CurrentUser\\My' `
+            -NotAfter (Get-Date).AddYears(3)
+
+          $pfxPath = Join-Path $tempDir 'signing-key.pfx'
+          $cerPath = Join-Path $tempDir 'signing-key-public.cer'
+
+          Export-PfxCertificate -Cert $certificate -FilePath $pfxPath -Password $securePassword | Out-Null
+          Export-Certificate -Cert $certificate -FilePath $cerPath | Out-Null
+
+          $pfxBase64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($pfxPath))
+
+          Write-Output "::add-mask::$password"
+          Write-Output "::add-mask::$pfxBase64"
+
+          "SIGNING_CERT_TEMP_DIR=$tempDir" >> $env:GITHUB_ENV
+          "SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+          "SIGNING_CERT_PUBLIC_PATH=$cerPath" >> $env:GITHUB_ENV
+          "SIGNING_PFX_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          "SIGNING_PFX_BASE64=$pfxBase64" >> $env:GITHUB_ENV
+
+      - name: Save signing secrets to repository
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.SECRETS_ADMIN_TOKEN }}
+        run: |
+          gh secret set SIGNING_PFX_BASE64 --repo "$env:GITHUB_REPOSITORY" --body "$env:SIGNING_PFX_BASE64"
+          gh secret set SIGNING_PFX_PASSWORD --repo "$env:GITHUB_REPOSITORY" --body "$env:SIGNING_PFX_PASSWORD"
+
+      - name: Upload public certificate
+        uses: actions/upload-artifact@v7
+        with:
+          name: signing-certificate-public
+          path: ${{ env.SIGNING_CERT_PUBLIC_PATH }}
+          if-no-files-found: error
+
+      - name: Cleanup temporary key files
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_CERT_THUMBPRINT)) {
+            $certPath = "Cert:\\CurrentUser\\My\\$($env:SIGNING_CERT_THUMBPRINT)"
+            if (Test-Path $certPath) {
+              Remove-Item -Path $certPath -Force
+            }
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_CERT_TEMP_DIR) -and (Test-Path $env:SIGNING_CERT_TEMP_DIR)) {
+            Remove-Item -Path $env:SIGNING_CERT_TEMP_DIR -Recurse -Force
+          }
